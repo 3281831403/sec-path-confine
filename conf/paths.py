@@ -1,9 +1,7 @@
 """Path-confinement contract for the upload-preview service.
 
-This module intentionally contains only stubs.  The eight public functions
-below define the security contract; each one raises ``NotImplementedError``
-until the task is implemented.  The contract is deliberately strict: all
-filesystem-facing functions use real paths, and comparisons have zero
+The eight public functions below implement a strict containment contract:
+all filesystem-facing functions use real paths, and comparisons have zero
 tolerance (no prefix, fuzzy, or case-sensitive shortcuts).
 """
 
@@ -33,7 +31,38 @@ def normalize(path: str) -> str:
     - Tolerance is 0: the returned spelling is the exact spelling used by
       every later comparison.
     """
-    raise NotImplementedError
+    # Defect 07: NFKC folds fullwidth letters and slash variants; the explicit
+    # replacements also catch any form NFKC leaves behind, then casefold fixes
+    # the case policy.  Nothing here is filesystem-dependent.
+    text = unicodedata.normalize("NFKC", path)
+    text = text.replace("＼", "/").replace("\\", "/").replace("／", "/")
+    text = text.casefold()
+
+    is_unc = text.startswith("//")
+    is_absolute = is_unc or text.startswith("/")
+
+    # Defect 01: collapse empty/"." segments and resolve ".." one segment at a
+    # time.  A ".." only pops a real directory segment; once the stack holds a
+    # leading run of ".." (or is empty on a relative path), further ".."
+    # segments stay at the front.  Dot-dot can never survive in the middle.
+    stack: list[str] = []
+    for segment in text.split("/"):
+        if segment == "" or segment == ".":
+            continue
+        if segment == "..":
+            if stack and stack[-1] != "..":
+                stack.pop()
+            else:
+                stack.append("..")
+        else:
+            stack.append(segment)
+
+    result = "/".join(stack)
+    if is_unc:
+        return "//" + result
+    if is_absolute:
+        return "/" + result
+    return result if result else "."
 
 
 def is_absolute_escape(path: str) -> bool:
@@ -50,7 +79,23 @@ def is_absolute_escape(path: str) -> bool:
       :func:`safe_join`.
     - Tolerance is 0: only the exact normalized forms decide the answer.
     """
-    raise NotImplementedError
+    # Defect 06: check every absolute spelling, including the drive-relative
+    # form "D:file" that has no separator after the colon.
+    normalized = normalize(path)
+    if normalized.startswith("/"):
+        return True
+    if (
+        len(normalized) >= 2
+        and normalized[1] == ":"
+        and normalized[0].isalpha()
+    ):
+        return True
+    return False
+
+
+def _has_leading_dotdot(normalized: str) -> bool:
+    """True when a normalized relative path escapes its base directory."""
+    return normalized == ".." or normalized.startswith("../")
 
 
 def resolve(root: str, path: str) -> str:
@@ -69,7 +114,17 @@ def resolve(root: str, path: str) -> str:
     - Tolerance is 0: the real-path string is compared exactly after the
       shared normalization.
     """
-    raise NotImplementedError
+    if not os.path.isabs(root) or not os.path.isdir(root):
+        raise ValueError("root must be an absolute, existing directory")
+    if is_absolute_escape(path):
+        raise ValueError("path must be relative, not absolute or drive-qualified")
+
+    normalized = normalize(path)
+    root_real = os.path.realpath(root)
+    joined = root_real if normalized == "." else os.path.join(root_real, normalized)
+    # Defect 04: realpath resolves symlinks/junctions against the actual
+    # filesystem, so a link-based escape is visible in the returned string.
+    return os.path.realpath(joined)
 
 
 def within(root: str, resolved: str) -> bool:
@@ -88,7 +143,15 @@ def within(root: str, resolved: str) -> bool:
     - Tolerance is 0: segment spelling must match exactly after
       normalization, with no allowance for extra or missing separators.
     """
-    raise NotImplementedError
+    normalized_root = normalize(root)
+    normalized_resolved = normalize(resolved)
+
+    # Defect 03: the root itself is inside the root.
+    if normalized_resolved == normalized_root:
+        return True
+    # Defect 02: require a directory separator after the root instead of a
+    # bare string prefix, so same-prefix siblings cannot pass.
+    return normalized_resolved.startswith(normalized_root + "/")
 
 
 def safe_join(root: str, path: str) -> str:
@@ -108,7 +171,23 @@ def safe_join(root: str, path: str) -> str:
     - Tolerance is 0: the returned real path must be exactly the root or an
       exact descendant of it.
     """
-    raise NotImplementedError
+    if not os.path.isabs(root) or not os.path.isdir(root):
+        raise ValueError("root must be an absolute, existing directory")
+    if is_absolute_escape(path):
+        raise ValueError("absolute, drive-qualified, or UNC paths are not allowed")
+
+    normalized = normalize(path)
+    if _has_leading_dotdot(normalized):
+        # Defect 10: raise instead of returning an empty string that callers
+        # might resolve against their working directory.
+        raise ValueError("relative path escapes the root")
+
+    resolved = resolve(root, path)
+    if not within(root, resolved):
+        raise ValueError("resolved real path escapes the root")
+    if not check_symlink(root, path):
+        raise ValueError("symlink target escapes the root")
+    return resolved
 
 
 def check_symlink(root: str, path: str) -> bool:
@@ -127,7 +206,19 @@ def check_symlink(root: str, path: str) -> bool:
     - Tolerance is 0: the link target must be the root or an exact
       descendant at a directory boundary.
     """
-    raise NotImplementedError
+    if not os.path.isabs(root):
+        return False
+    if is_absolute_escape(path):
+        return False
+    if _has_leading_dotdot(normalize(path)):
+        return False
+
+    try:
+        # Defect 05: judge the resolved target, not the link's basename.
+        resolved = resolve(root, path)
+    except ValueError:
+        return False
+    return within(root, resolved)
 
 
 def validate_policy(policy: dict) -> list[str]:
@@ -148,7 +239,20 @@ def validate_policy(policy: dict) -> list[str]:
     - Tolerance is 0: boolean settings are checked strictly, and the root is
       not accepted with a relative or empty spelling.
     """
-    raise NotImplementedError
+    issues: list[str] = []
+
+    # Defect 08: strict boolean checks; missing keys fail closed.
+    if policy.get("resolve_symlinks") is not True:
+        issues.append("symlinks are not resolved")
+
+    root = policy.get("root")
+    if not isinstance(root, str) or not root or not os.path.isabs(root):
+        issues.append("root is not restricted")
+
+    if policy.get("allow_absolute") is not False:
+        issues.append("absolute paths are allowed")
+
+    return issues
 
 
 def join_batch(root: str, paths: list[str]) -> dict[str, str]:
@@ -166,4 +270,6 @@ def join_batch(root: str, paths: list[str]) -> dict[str, str]:
     - An empty batch returns an empty dictionary.  Tolerance is 0: keys are
       the original spellings and values are exact real paths.
     """
-    raise NotImplementedError
+    # Defect 09: no shared/module-level root state; each entry goes through
+    # safe_join with this call's root argument, and an escape propagates.
+    return {item: safe_join(root, item) for item in paths}
